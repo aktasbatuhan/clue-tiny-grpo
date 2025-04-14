@@ -31,6 +31,7 @@ def load_model(
     model = LlamaForCausalLM.from_pretrained(
         model_name_or_path,
         trust_remote_code=trust_remote_code,
+        attn_implementation="flash_attention_2",  # Re-enabling Flash Attention for GPU
         torch_dtype=torch.bfloat16 if bf16 else "auto",
         device_map=device_map,
     )
@@ -54,7 +55,7 @@ def rollout(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[str]]:
 
     model.eval()
-
+    
     # Extract data from this task, handling the format from the custom collate function
     # With batch_size=1 and custom_collate, we get {key: [value]} instead of just {key: value}
     # Get the first (and only) item from each list if it exists
@@ -81,10 +82,7 @@ def rollout(
         dummy_rewards = torch.zeros((num_rollouts, 1), dtype=torch.float, device=model.device)
         return dummy_tensor, dummy_rewards, dummy_tensor.bool(), []
 
-
-    # 1. format prompt (using Cluedo system prompt)
-    # The raw prompt might not have clear JSON formatting instructions
-    # Let's enhance it to emphasize the need for JSON output format
+    # 1. format prompt with JSON formatting instructions
     if interaction_type == "memory_update":
         if not prompt_text.endswith("Respond ONLY with a JSON object."):
             # Add JSON formatting instruction to the end of the prompt
@@ -95,6 +93,7 @@ def rollout(
         # For other interaction types, use the prompt as-is
         chat_prompt = prompt_text
 
+    # Efficient batched tokenization for GPU
     model_inputs = tokenizer(
         [chat_prompt] * num_rollouts, # Repeat prompt for batch generation
         return_tensors="pt",
@@ -108,20 +107,25 @@ def rollout(
     input_ids = model_inputs["input_ids"]
     attention_mask = model_inputs["attention_mask"]
 
-    # 2. sample completions
-    pad_token_id = tokenizer.pad_token_id or tokenizer.eos_token_id # Handle potential missing pad_token_id
+    # 2. sample completions with efficient generation config
+    pad_token_id = tokenizer.pad_token_id or tokenizer.eos_token_id
     generation_config = GenerationConfig(
         do_sample=True,
         top_p=top_p,
         temperature=temperature,
-        max_new_tokens=100, # Limit generated output length (adjust as needed)
+        max_new_tokens=100, # Limit generated output length
         pad_token_id=pad_token_id,
+        do_stream=False, # Disable streaming for batch efficiency
     )
-    sequence_ids = model.generate(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        generation_config=generation_config
-    )
+    
+    # Use efficient generation
+    with torch.cuda.amp.autocast(dtype=torch.bfloat16):  # Use mixed precision on GPU
+        sequence_ids = model.generate(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            generation_config=generation_config
+        )
+    
     completions = tokenizer.batch_decode(
         sequence_ids[:, input_ids.shape[1]:], skip_special_tokens=True
     )
@@ -290,44 +294,46 @@ def custom_collate(batch):
 
 def main():
     seed = 42
-    wandb_project = "cluedo_grpo" # Set WandB project name
+    wandb_project = "cluedo_grpo"  # Set WandB project name
     device_index = 0
-    # Recommend using a larger model if feasible, but 1B is okay for testing
-    model_name = "meta-llama/Llama-3.2-1B-Instruct"
-    checkpoint_path = Path("./output_cluedo") # Separate output dir
+    # Larger model is better with GPU available
+    model_name = "meta-llama/Llama-3.2-7B-Instruct"  # Upgraded to 7B model
+    checkpoint_path = Path("./output_cluedo")  # Separate output dir
     checkpoint_interval = 20
-    train_batch_size = 16 # Adjust based on GPU memory
-    lr = 5e-6 # Starting learning rate
-    kl_weight = 0.01 # D_KL coefficient in loss
-    clip_eps = 0.2 # PPO clipping epsilon
+    train_batch_size = 32  # Increased for GPU (adjust based on GPU memory)
+    lr = 5e-6  # Starting learning rate
+    kl_weight = 0.01  # D_KL coefficient in loss
+    clip_eps = 0.2  # PPO clipping epsilon
 
-    group_size = 12 # Number of rollouts per prompt in a GRPO step
-    # Rollouts per step might need adjustment based on dataset size and batch size
-    # If dataset is small (359 examples), maybe rollouts_per_step = dataset size?
-    # Or maybe a fraction like 64? Let's start with a modest number.
-    rollouts_per_step = 32 # Number of prompts processed per training step (gradient accumulation)
-    epochs_per_step = 1 # Number of training epochs on collected rollouts
+    group_size = 24  # Doubled number of rollouts per prompt in a GRPO step
+    rollouts_per_step = 64  # Doubled number of prompts processed per training step
+    epochs_per_step = 1  # Number of training epochs on collected rollouts
     max_norm = 1.0  # gradient clipping
 
     # rollout params
-    max_length = 1024 # Max sequence length (prompt + generation)
-    top_p = 0.9 # Sampling params for generation
-    temperature = 0.7 # Sampling params for generation
+    max_length = 1024  # Max sequence length (prompt + generation)
+    top_p = 0.9  # Sampling params for generation
+    temperature = 0.7  # Sampling params for generation
 
-    # Correct device initialization
+    # Prioritize CUDA GPU
     if torch.cuda.is_available():
         device = torch.device("cuda", device_index)
         print(f"Using CUDA device: {device_index}")
+        print(f"GPU: {torch.cuda.get_device_name(device_index)}")
+        print(f"GPU Memory: {torch.cuda.get_device_properties(device_index).total_memory / 1e9:.2f} GB")
     else:
         device = torch.device("cpu")
-        print("CUDA not available, using CPU.")
-
+        print("CUDA not available, using CPU. Training will be much slower.")
+    
     cpu_device = torch.device("cpu")
     init_rng(seed)
-    # print(f"Using device: {device}") # Already printed above
 
-    reference_model, _ = load_model(model_name, device_map=device)
-    model, tokenizer = load_model(model_name, device_map=device)
+    # Load models
+    print(f"Loading models: {model_name}")
+    reference_model, _ = load_model(model_name, device_map="auto")  # Use auto device mapping
+    model, tokenizer = load_model(model_name, device_map="auto")
+    print("Models loaded successfully")
+    
     optimizer = optim.Adam(model.parameters(), lr=lr)
 
     # Ensure pad token is set for tokenizer
